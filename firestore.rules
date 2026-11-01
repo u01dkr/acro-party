@@ -1,0 +1,10 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Anyone who opened the app (signed in anonymously) can play.
+    // Fine for friends & family games.
+    match /games/{code}/{document=**} {
+      allow read, write: if request.auth != null;
+    }
+  }
+}
