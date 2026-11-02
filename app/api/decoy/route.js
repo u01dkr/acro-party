@@ -1,8 +1,21 @@
 // Server-side: asks Claude for a fake answer. Your API key never reaches players' phones.
+//
+// Longer acronyms (5–6 letters) are hard to hit exactly, so we ask for several
+// ideas at once and keep only the ones that fit the letters perfectly.
 import { checkAnswer, cleanAnswer } from "../../../lib/game";
 
 export async function GET() {
   return Response.json({ enabled: !!process.env.ANTHROPIC_API_KEY });
+}
+
+// Tidies a line like `3. "Pizza Tastes Lovely!"` into `Pizza Tastes Lovely`
+function tidy(line) {
+  return cleanAnswer(
+    line
+      .replace(/^\s*(\d+[.)]|[-*•])\s*/, "") // list numbers / bullets
+      .replace(/["“”*]/g, "") // quotes and bold
+      .replace(/[.!?,;:]+$/, "") // trailing punctuation
+  );
 }
 
 export async function POST(req) {
@@ -14,12 +27,19 @@ export async function POST(req) {
     return Response.json({ error: "Bad request" }, { status: 400 });
   }
 
-  const prompt = `We're playing a family acronym party game. Category: ${category}. Letters: ${letters.split("").join(" ")}.
-Write ONE funny answer with exactly ${letters.length} words, each starting with those letters in order.
-Make it sound like a witty friend typed it on their phone — casual, clever, not too polished, family-friendly.
-Reply with ONLY the answer, nothing else.`;
+  const wordGuide = letters
+    .split("")
+    .map((l, i) => `word ${i + 1} starts with ${l}`)
+    .join(", ");
 
-  for (let attempt = 0; attempt < 3; attempt++) {
+  const prompt = `We're playing a family acronym party game. Category: ${category}. Letters: ${letters}.
+Write 6 different funny answers. Each answer must be EXACTLY ${letters.length} words: ${wordGuide}.
+No extra words — not even "the", "of" or "and" unless they start with the right letter in the right place. No hyphens.
+Make them sound like a witty friend typed them on their phone: casual, clever, family-friendly, about ${category}.
+Reply with the 6 answers only, one per line, no numbering.`;
+
+  const errors = [];
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
@@ -29,21 +49,30 @@ Reply with ONLY the answer, nothing else.`;
           "content-type": "application/json",
         },
         body: JSON.stringify({
-          model: process.env.ANTHROPIC_MODEL || "claude-haiku-5-5",
-          max_tokens: 60,
+          model: process.env.ANTHROPIC_MODEL || "claude-sonnet-5-5",
+          max_tokens: 400,
           messages: [{ role: "user", content: prompt }],
         }),
+        signal: AbortSignal.timeout(20000),
       });
       if (!res.ok) {
-        console.error("Anthropic error", res.status, await res.text());
+        const body = await res.text();
+        console.error("Anthropic error", res.status, body);
+        errors.push(`Anthropic ${res.status}: ${body.slice(0, 200)}`);
         continue;
       }
       const data = await res.json();
-      const text = cleanAnswer(data.content?.[0]?.text || "").replace(/^["']|["'.]$/g, "");
-      if (checkAnswer(text, letters).ok) return Response.json({ text });
+      const raw = (data.content || []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
+      const valid = raw.split("\n").map(tidy).filter((t) => t && checkAnswer(t, letters).ok);
+      if (valid.length) {
+        return Response.json({ text: valid[Math.floor(Math.random() * valid.length)] });
+      }
+      console.warn("No valid decoy in:", raw);
+      errors.push("No answer fitted the letters");
     } catch (e) {
       console.error(e);
+      errors.push(String(e.message || e));
     }
   }
-  return Response.json({ error: "No valid answer" }, { status: 502 });
+  return Response.json({ error: "No valid answer", details: errors }, { status: 502 });
 }

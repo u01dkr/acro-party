@@ -7,6 +7,7 @@ import { getDb, ensureSignedIn } from "../../../lib/firebase";
 import * as A from "../../../lib/actions";
 import { AI_ID, MAX_PLAYERS } from "../../../lib/game";
 import { saveProfile } from "../../../lib/profile";
+import { syncClock, serverNow } from "../../../lib/clock";
 import { JoinForm, Lobby, Writing, Voting, Results, Leaderboard, Logo } from "../../../components/screens";
 import Chat from "../../../components/Chat";
 
@@ -59,9 +60,23 @@ export default function GamePage() {
     return () => { u1(); u2(); };
   }, [uid, code, round]);
 
+  // Line this phone's clock up with the server (and again whenever you come back to the app)
+  useEffect(() => {
+    if (!uid) return;
+    syncClock(code, uid);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        setNow(serverNow());
+        syncClock(code, uid);
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [uid, code]);
+
   // Clock tick for timers
   useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 500);
+    const t = setInterval(() => setNow(serverNow()), 250);
     return () => clearInterval(t);
   }, []);
 
@@ -82,36 +97,24 @@ export default function GamePage() {
   const roundVotes = votes.filter((v) => v.round === round);
   const me = players.find((p) => p.id === uid);
 
-  // Moves the game on when everyone's done or time runs out.
-  // The host's phone does this; if the host drops out, anyone's phone takes over after a few seconds.
+  // Moves the game on when the timer runs out (always the full time, so people
+  // can change their answer or vote right up to the end).
+  // Every phone watches for this, so it doesn't matter if the host's phone is
+  // locked or in another app — the first phone to notice moves everyone on.
   useEffect(() => {
     if (!game || !uid || !players.length) return;
-    const late = now > (game.phaseEndsAt || 0) + 3000;
-    if (!isHost && !late) return;
+    if (!["writing", "voting"].includes(game.phase) || now <= game.phaseEndsAt) return;
     const key = `${game.phase}-${game.round}`;
     if (busy.current === key) return;
-
-    const run = (fn) => {
-      busy.current = key;
-      fn().catch((e) => { console.error(e); busy.current = ""; });
-    };
-
-    if (game.phase === "writing") {
-      const submitted = roundAnswers.filter((a) => a.playerId !== AI_ID && players.some((p) => p.id === a.playerId));
-      if (submitted.length >= players.length || now > game.phaseEndsAt) {
-        run(() => A.advanceToVoting(code, game.round));
-      }
-    } else if (game.phase === "voting") {
-      const eligible = players.filter((p) => roundAnswers.some((a) => a.playerId !== p.id));
-      const allVoted = eligible.every((p) => roundVotes.some((v) => v.voterId === p.id));
-      if (allVoted || now > game.phaseEndsAt) {
-        run(() => A.finishVoting(code, game.round, players, roundAnswers, roundVotes));
-      }
-    }
-  }, [now, game, players, roundAnswers, roundVotes, uid, isHost, code]);
+    busy.current = key;
+    const step = game.phase === "writing"
+      ? A.advanceToVoting(code, game.round)
+      : A.finishVoting(code, game.round, players);
+    step.catch((e) => { console.error(e); busy.current = ""; });
+  }, [now, game, players, uid, code]);
 
   const startRound = async (r) => {
-    const res = await A.startRound(code, r);
+    const res = A.startRound(code, game, r);
     if (res && game?.aiDecoy) A.addDecoy(code, r, res.letters, res.category);
   };
 

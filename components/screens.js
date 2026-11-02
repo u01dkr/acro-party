@@ -230,7 +230,9 @@ export function Voting({ game, players, answers, votes, uid, code, now }) {
       <div className="letters">
         {game.letters.split("").map((l, i) => <span key={i} className="tile">{l}</span>)}
       </div>
-      <p className="muted center">Tap your favourite. You can't vote for your own!</p>
+      <p className="muted center">
+        {myVote ? "Changed your mind? Tap another one before time's up." : "Tap your favourite. You can't vote for your own!"}
+      </p>
       {sorted.length === 0 && <div className="banner">Nobody answered this round 😅</div>}
       <div className="answers">
         {sorted.map((a) => {
