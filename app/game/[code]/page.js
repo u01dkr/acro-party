@@ -2,7 +2,7 @@
 // The game itself. Listens to the database live and shows the right screen.
 import { useEffect, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { doc, collection, onSnapshot, query, where, orderBy } from "firebase/firestore";
+import { doc, collection, onSnapshot, query, where, orderBy, getDocFromServer } from "firebase/firestore";
 import { getDb, ensureSignedIn } from "../../../lib/firebase";
 import * as A from "../../../lib/actions";
 import { AI_ID, MAX_PLAYERS } from "../../../lib/game";
@@ -10,6 +10,10 @@ import { saveProfile } from "../../../lib/profile";
 import { syncClock, serverNow } from "../../../lib/clock";
 import { JoinForm, Lobby, Writing, Voting, Results, Leaderboard, Logo } from "../../../components/screens";
 import Chat from "../../../components/Chat";
+
+// Orders the stages of a game so a phone can tell newer data from older
+const STAGES = ["lobby", "writing", "voting", "results", "leaderboard", "finished"];
+const stageKey = (g) => (g.round || 0) * 10 + Math.max(0, STAGES.indexOf(g.phase));
 
 export default function GamePage() {
   const params = useParams();
@@ -25,11 +29,19 @@ export default function GamePage() {
   const [now, setNow] = useState(Date.now());
   const [decoyAvailable, setDecoyAvailable] = useState(false);
   const busy = useRef("");
+  // Bumping this tears down and reopens the live connections (see the safety net below)
+  const [resub, setResub] = useState(0);
+  const gameRef = useRef(null);
 
   // Sign in quietly
   useEffect(() => {
     ensureSignedIn().then((u) => setUid(u.uid)).catch((e) => setError(e.message));
   }, []);
+
+  // New game (e.g. after "Play again"): forget the old one
+  useEffect(() => {
+    gameRef.current = null;
+  }, [code]);
 
   // Live game + players
   useEffect(() => {
@@ -37,14 +49,20 @@ export default function GamePage() {
     const db = getDb();
     const u1 = onSnapshot(
       doc(db, "games", code),
-      (s) => setGame(s.exists() ? { id: s.id, ...s.data() } : null),
+      (s) => {
+        const g = s.exists() ? { id: s.id, ...s.data() } : null;
+        // Never step back to an older stage of the game
+        if (g && gameRef.current && stageKey(g) < stageKey(gameRef.current)) return;
+        gameRef.current = g;
+        setGame(g);
+      },
       (e) => setError(e.message)
     );
     const u2 = onSnapshot(query(collection(db, "games", code, "players"), orderBy("joinedAt")), (s) =>
       setPlayers(s.docs.map((d) => ({ id: d.id, ...d.data() })))
     );
     return () => { u1(); u2(); };
-  }, [uid, code]);
+  }, [uid, code, resub]);
 
   // Live answers + votes for the current round
   const round = game?.round ?? 0;
@@ -58,7 +76,48 @@ export default function GamePage() {
       setVotes(s.docs.map((d) => ({ id: d.id, ...d.data() })))
     );
     return () => { u1(); u2(); };
-  }, [uid, code, round]);
+  }, [uid, code, round, resub]);
+
+  // Safety net for iPhones: Safari can quietly stop delivering live updates (screen dims,
+  // switching apps), leaving one phone stuck on an old screen. So every few seconds,
+  // and whenever you come back to the app, check the server directly. If this phone
+  // has fallen behind, catch up straight away and reopen the live connections.
+  useEffect(() => {
+    if (!uid) return;
+    const ref = doc(getDb(), "games", code);
+    const check = async () => {
+      try {
+        const s = await getDocFromServer(ref);
+        if (!s.exists()) return;
+        const g = { id: s.id, ...s.data() };
+        const cur = gameRef.current;
+        if (!cur || stageKey(g) > stageKey(cur) || (g.nextGame && !cur.nextGame)) {
+          gameRef.current = g;
+          setGame(g);
+          setResub((n) => n + 1);
+        }
+      } catch {
+        /* offline: try again next time */
+      }
+    };
+    const poll = setInterval(() => {
+      if (document.visibilityState === "visible" && gameRef.current?.phase !== "finished") check();
+    }, 3000);
+    const onBack = () => {
+      if (document.visibilityState !== "visible") return;
+      setResub((n) => n + 1); // fresh live connections after being away
+      check();
+    };
+    document.addEventListener("visibilitychange", onBack);
+    window.addEventListener("online", onBack);
+    window.addEventListener("focus", onBack);
+    return () => {
+      clearInterval(poll);
+      document.removeEventListener("visibilitychange", onBack);
+      window.removeEventListener("online", onBack);
+      window.removeEventListener("focus", onBack);
+    };
+  }, [uid, code]);
 
   // Line this phone's clock up with the server (and again whenever you come back to the app)
   useEffect(() => {
