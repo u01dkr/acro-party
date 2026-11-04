@@ -3,7 +3,8 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { doc, collection, onSnapshot, query, where, orderBy, getDocFromServer } from "firebase/firestore";
-import { getDb, ensureSignedIn } from "../../../lib/firebase";
+import { getDb, ensureSignedIn, restartConnection } from "../../../lib/firebase";
+import { readDirect, listDirect } from "../../../lib/direct";
 import * as A from "../../../lib/actions";
 import { AI_ID, MAX_PLAYERS } from "../../../lib/game";
 import { saveProfile } from "../../../lib/profile";
@@ -79,43 +80,87 @@ export default function GamePage() {
   }, [uid, code, round, resub]);
 
   // Safety net for iPhones: Safari can quietly stop delivering live updates (screen dims,
-  // switching apps), leaving one phone stuck on an old screen. So every few seconds,
-  // and whenever you come back to the app, check the server directly. If this phone
-  // has fallen behind, catch up straight away and reopen the live connections.
+  // switching apps), leaving one phone stuck on an old screen. So every 3 seconds, and
+  // whenever you come back to the app, read the game over a plain web request that doesn't
+  // rely on the live connection. If this phone has fallen behind, catch up straight away
+  // (game, players, answers and votes) and restart the stuck live connection.
   useEffect(() => {
     if (!uid) return;
     const ref = doc(getDb(), "games", code);
+    let cancelled = false;
+    let checking = false;
+
+    const readGame = async () => {
+      const g = await readDirect(`games/${code}`);
+      if (g !== undefined) return g;
+      // Plain request not possible: fall back to Firebase's own fetch, with a time limit
+      // (it can hang when the connection is stuck)
+      const s = await Promise.race([
+        getDocFromServer(ref).catch(() => null),
+        new Promise((res) => setTimeout(() => res(null), 4000)),
+      ]);
+      return s?.exists() ? { id: s.id, ...s.data() } : undefined;
+    };
+
+    const refreshPlayers = async () => {
+      const list = await listDirect(`games/${code}/players`);
+      if (list && !cancelled) setPlayers(list.sort((x, y) => (x.joinedAt || 0) - (y.joinedAt || 0)));
+    };
+    const refreshRound = async (r) => {
+      if (!r) return;
+      const [ans, vts] = await Promise.all([listDirect(`games/${code}/answers`), listDirect(`games/${code}/votes`)]);
+      if (cancelled) return;
+      if (ans) setAnswers(ans.filter((x) => x.round === r));
+      if (vts) setVotes(vts.filter((x) => x.round === r));
+    };
+
     const check = async () => {
+      if (cancelled || checking) return;
+      checking = true;
       try {
-        const s = await getDocFromServer(ref);
-        if (!s.exists()) return;
-        const g = { id: s.id, ...s.data() };
+        const g = await readGame();
+        if (!g || cancelled) return;
         const cur = gameRef.current;
         if (!cur || stageKey(g) > stageKey(cur) || (g.nextGame && !cur.nextGame)) {
+          // Behind: catch up on everything, then give the live connection a kick
           gameRef.current = g;
           setGame(g);
-          setResub((n) => n + 1);
+          await Promise.all([refreshPlayers(), refreshRound(g.round)]);
+          if (cur) {
+            await restartConnection();
+            setResub((n) => n + 1);
+          }
+        } else if (g.phase === "lobby") {
+          await refreshPlayers(); // so the host sees everyone who's joined
         }
       } catch {
         /* offline: try again next time */
+      } finally {
+        checking = false;
       }
     };
+
     const poll = setInterval(() => {
       if (document.visibilityState === "visible" && gameRef.current?.phase !== "finished") check();
     }, 3000);
     const onBack = () => {
       if (document.visibilityState !== "visible") return;
-      setResub((n) => n + 1); // fresh live connections after being away
+      restartConnection().then(() => setResub((n) => n + 1)); // fresh live connections after being away
       check();
     };
+    // After sending an answer or vote, fetch the latest straight away
+    const onSent = () => refreshRound(gameRef.current?.round);
     document.addEventListener("visibilitychange", onBack);
     window.addEventListener("online", onBack);
-    window.addEventListener("focus", onBack);
+    window.addEventListener("focus", check);
+    window.addEventListener("acro:refresh", onSent);
     return () => {
+      cancelled = true;
       clearInterval(poll);
       document.removeEventListener("visibilitychange", onBack);
       window.removeEventListener("online", onBack);
-      window.removeEventListener("focus", onBack);
+      window.removeEventListener("focus", check);
+      window.removeEventListener("acro:refresh", onSent);
     };
   }, [uid, code]);
 
